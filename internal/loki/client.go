@@ -15,10 +15,22 @@ type Client struct {
 }
 
 func NewClient(baseURL string) *Client {
+	// Configure transport to handle large responses and prevent connection reuse issues
+	transport := &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+		// Add these to prevent EOF on large responses
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	return &Client{
 		BaseURL: baseURL,
 		HTTPClient: &http.Client{
-			Timeout: 20 * time.Second,
+			Timeout:   90 * time.Second,
+			Transport: transport,
 		},
 	}
 }
@@ -48,13 +60,18 @@ func (c *Client) QueryRange(ctx context.Context, query string, start, end time.T
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("loki HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Check status code before decoding to provide better error messages
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("loki returned status %d: %s", resp.StatusCode, resp.Status)
+	}
+
 	var out QueryRangeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode loki response: %w", err)
 	}
 	if out.Status != "success" {
 		if out.Error != "" {

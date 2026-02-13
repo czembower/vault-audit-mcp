@@ -101,6 +101,9 @@ func populateFromAudit(ev *Event, m map[string]any) {
 		if v, ok := req["mount_type"].(string); ok {
 			ev.MountType = v
 		}
+		if v, ok := req["mount_class"].(string); ok {
+			ev.MountClass = v
+		}
 		if v, ok := req["id"].(string); ok {
 			ev.RequestID = v
 		}
@@ -114,10 +117,73 @@ func populateFromAudit(ev *Event, m map[string]any) {
 		}
 	}
 
+	// response.* (fallbacks when request block is missing or empty)
+	if resp, ok := m["response"].(map[string]any); ok {
+		if ev.MountType == "" {
+			if v, ok := resp["mount_type"].(string); ok {
+				ev.MountType = v
+			}
+		}
+		if ev.MountClass == "" {
+			if v, ok := resp["mount_class"].(string); ok {
+				ev.MountClass = v
+			}
+		}
+		if ev.Display == "" {
+			if auth, ok := resp["auth"].(map[string]any); ok {
+				if v, ok := auth["display_name"].(string); ok {
+					ev.Display = v
+				}
+			}
+		}
+	}
+
 	// auth.display_name
 	if auth, ok := m["auth"].(map[string]any); ok {
 		if v, ok := auth["display_name"].(string); ok {
 			ev.Display = v
+		}
+		// Extract policy information
+		if policies, ok := auth["policies"].([]interface{}); ok {
+			ev.Policies = make([]string, 0, len(policies))
+			for _, p := range policies {
+				if pStr, ok := p.(string); ok {
+					ev.Policies = append(ev.Policies, pStr)
+				}
+			}
+		}
+		if tokenPolicies, ok := auth["token_policies"].([]interface{}); ok {
+			ev.TokenPolicies = make([]string, 0, len(tokenPolicies))
+			for _, p := range tokenPolicies {
+				if pStr, ok := p.(string); ok {
+					ev.TokenPolicies = append(ev.TokenPolicies, pStr)
+				}
+			}
+		}
+		if entityID, ok := auth["entity_id"].(string); ok {
+			ev.EntityID = entityID
+		}
+	}
+
+	// top-level fallbacks for flattened audit logs
+	if ev.Path == "" {
+		if v, ok := m["path"].(string); ok {
+			ev.Path = v
+		}
+	}
+	if ev.Operation == "" {
+		if v, ok := m["operation"].(string); ok {
+			ev.Operation = v
+		}
+	}
+	if ev.MountType == "" {
+		if v, ok := m["mount_type"].(string); ok {
+			ev.MountType = v
+		}
+	}
+	if ev.MountClass == "" {
+		if v, ok := m["mount_class"].(string); ok {
+			ev.MountClass = v
 		}
 	}
 
@@ -131,8 +197,8 @@ func populateFromAudit(ev *Event, m map[string]any) {
 	}
 }
 
-func latestValue(values [][]string) float64 {
-	// values: [[ts, "number"], ...]
+func latestValue(values [][]interface{}) float64 {
+	// values: [[ts, "number/metric"], ...] - second element can be string or numeric from Loki
 	if len(values) == 0 {
 		return 0
 	}
@@ -140,7 +206,19 @@ func latestValue(values [][]string) float64 {
 	if len(last) != 2 {
 		return 0
 	}
-	f, err := strconv.ParseFloat(last[1], 64)
+
+	// Handle both string (from log queries) and numeric (from metric queries) values
+	var strVal string
+	switch v := last[1].(type) {
+	case string:
+		strVal = v
+	case float64:
+		strVal = strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return 0
+	}
+
+	f, err := strconv.ParseFloat(strVal, 64)
 	if err != nil {
 		return 0
 	}
