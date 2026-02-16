@@ -1,23 +1,31 @@
 # vault-audit-mcp
 
-An MCP (Model Context Protocol) server for querying Vault audit logs stored in Loki.
+An MCP (Model Context Protocol) server for querying Vault audit logs in Loki.
 
 ## Features
 
-- **Search Events**: Query Vault audit events by namespace, operation, mount type, and status
-- **Aggregate**: Count events grouped by any dimension (namespace/operation/mount_type/status)
-- **Trace**: Follow a specific request ID through audit logs
+- Search Vault audit events with label-based filters
+- Aggregate event counts by label dimensions
+- Trace all events for a Vault request ID
+- Retrieve detailed events for a request ID
 
-## Prerequisites
+## Prerequisites (Loki-specific)
 
-- Vault configured with Loki as an audit backend
-- Loki instance receiving Vault audit logs with labels:
+- Vault configured with an audit device that ships logs to Loki
+- Loki instance receiving Vault audit logs with these baseline labels:
   - `service=vault`
   - `log_kind=audit`
-  - `vault_namespace` (e.g., `root`, `team-a/`)
-  - `vault_operation` (e.g., `create`, `read`, `update`, `delete`)
-  - `vault_mount_type` (e.g., `pki`, `kv`, `userpass`)
-  - `vault_status` (e.g., `ok`, `error`)
+
+For full filtering support, ensure these labels are also present:
+
+- `vault_namespace` (e.g., `root`, `team-a/`)
+- `vault_operation` (e.g., `create`, `read`, `update`, `delete`)
+- `vault_mount_type` (e.g., `pki`, `kv`, `userpass`)
+- `vault_status` (e.g., `ok`, `error`)
+- `vault_mount_class` (e.g., `auth`, `secret`, `system`)
+- `vault_entity_id`
+- `vault_policies` (comma-separated)
+- `vault_token_policies` (comma-separated)
 
 ## Building
 
@@ -27,65 +35,73 @@ go build -o server ./cmd/server
 
 ## Running
 
-Set the Loki URL (defaults to `http://localhost:3100`):
+Set Loki URL (defaults to `http://localhost:3100`):
 
 ```bash
 LOKI_URL=http://localhost:3100 ./server
 ```
 
-The server uses stdio transport and is ready to be used with MCP clients (Claude Desktop, etc).
+The server uses stdio transport and is ready for MCP clients.
 
 ## Configuration
 
 ### Environment Variables
 
 - `LOKI_URL` - Loki API endpoint (default: `http://localhost:3100`)
+- `AUDIT_DEBUG_LOG` - Enable debug query logging (`1` or `true`)
 
 ## Tools
 
-### audit.search_events
+### `audit.search_events`
 
-Search Vault audit events by label filters.
+Search Vault audit events. Returns a summarized result (statistics, top dimensions, key insights, and sample events).
 
-**Parameters:**
+Parameters:
 - `start_rfc3339` - Start time (RFC3339, defaults to now-15m)
 - `end_rfc3339` - End time (RFC3339, defaults to now)
 - `limit` - Max results (1-500, default 100)
-- `namespace` - Filter by Vault namespace
-- `operation` - Filter by operation type
+- `namespace` - Filter by namespace
+- `operation` - Filter by operation (supports special handling for `login` and write/update aliasing)
 - `mount_type` - Filter by mount type
-- `status` - Filter by status (ok or error)
+- `mount_class` - Filter by mount class
+- `status` - Filter by status (`ok` or `error`)
+- `policy` - Filter by policy name (matches both `vault_policies` and `vault_token_policies`)
+- `entity_id` - Filter by entity ID
 
-### audit.aggregate
+### `audit.aggregate`
 
 Count events grouped by a dimension.
 
-**Parameters:**
+Parameters:
 - `start_rfc3339` - Start time (RFC3339, defaults to now-15m)
 - `end_rfc3339` - End time (RFC3339, defaults to now)
-- `by` - Aggregation dimension (vault_namespace, vault_operation, vault_mount_type, or vault_status)
-- `namespace`, `operation`, `mount_type`, `status` - Optional filters
+- `by` - Aggregation dimension
+  - Currently supported at runtime: `vault_namespace`, `vault_operation`, `vault_mount_type`, `vault_status`
+  - Note: `vault_mount_class` exists in the tool schema but is currently rejected by backend validation
+- Optional filters: `namespace`, `operation`, `mount_type`, `mount_class`, `status`
 
-### audit.trace
+### `audit.trace`
 
-Find all events for a specific request ID.
+Find events for a specific request ID over a time range. Returns a summarized timeline.
 
-**Parameters:**
+Parameters:
 - `start_rfc3339` - Start time (RFC3339, defaults to now-15m)
 - `end_rfc3339` - End time (RFC3339, defaults to now)
-- `limit` - Max results (default 100)
-- `request_id` - Vault request ID to trace (required)
+- `limit` - Max results (default 100, max 500)
+- `request_id` - Vault request ID (required)
+
+### `audit.get_event_details`
+
+Retrieve detailed events for a request ID.
+
+Parameters:
+- `request_id` - Vault request ID (required)
+
+Notes:
+- Looks back over the last 24 hours
+- Returns detailed event objects (including redacted `raw` audit payload)
 
 ## Testing
-
-### Build and Run
-
-```bash
-go build -o server ./cmd/server
-LOKI_URL=http://localhost:3100 ./server
-```
-
-### Run Tests
 
 ```bash
 go test ./internal/audit -v
@@ -93,7 +109,7 @@ go test ./internal/audit -v
 
 ## Vault Configuration
 
-Configure Vault to send audit logs to Loki. Example with JSON formatting:
+Configure Vault audit output (example):
 
 ```hcl
 audit {
@@ -103,14 +119,17 @@ audit {
 }
 ```
 
-Then pipe Vault logs through a log shipper (Promtail, Logstash, etc.) with appropriate labels.
+Then ship logs (Promtail, etc.) to Loki and attach the labels above.
 
 ## Data Sensitivity
 
-All returned events are automatically redacted to remove:
-- Authentication tokens and accessors
-- Secret IDs
-- Request/response bodies containing sensitive data
-- Error messages with secret references
+Returned events are redacted in code before response. Current redaction includes:
 
-Non-sensitive fields like paths, operations, and namespaces are preserved for analysis.
+- Top-level `error` / `errors`
+- `auth.client_token`, `auth.accessor`, `auth.secret_id`, `auth.metadata`
+- `response.auth.client_token`, `response.auth.accessor`, `response.auth.secret_id`
+- `response.secret.data`
+- `response.wrap_info`
+- `request.data`
+
+Other fields (for example path, operation, namespace, mount metadata, and some response fields) may be preserved for analysis.
