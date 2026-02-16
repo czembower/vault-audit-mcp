@@ -133,3 +133,11 @@ Returned events are redacted in code before response. Current redaction includes
 - `request.data`
 
 Other fields (for example path, operation, namespace, mount metadata, and some response fields) may be preserved for analysis.
+
+## Security Disclaimer
+
+Vault audit logs should be treated as sensitive data. They can contain security-relevant metadata and potentially sensitive operational context.
+
+Protecting audit log access is critical. Apply strong authentication, authorization, transport security, and storage controls in your logging and observability stack.
+
+This project does not provide any built-in mechanism for securing access to audit logs or backend storage providers. Access control and data protection are the responsibility of your surrounding infrastructure and platform configuration.
