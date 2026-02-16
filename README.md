@@ -1,6 +1,6 @@
 # vault-audit-mcp
 
-An MCP (Model Context Protocol) server for querying Vault audit logs in Loki.
+An MCP (Model Context Protocol) server for querying Vault audit logs from a pluggable backend provider. At present, the only supported storage backend is Loki, but intention is to develop adapters for Splunk and Elasticsearch next.
 
 ## Features
 
