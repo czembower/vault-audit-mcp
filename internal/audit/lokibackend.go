@@ -17,6 +17,9 @@ type LokiBackend struct {
 	client *loki.Client
 }
 
+const queryChunkDuration = 10 * time.Minute
+const maxPerQueryRangeLimit = 25
+
 // NewLokiBackend creates a new Loki backend instance.
 func NewLokiBackend(client *loki.Client) *LokiBackend {
 	return &LokiBackend{client: client}
@@ -51,6 +54,7 @@ func (b *LokiBackend) Search(ctx context.Context, filter *SearchFilter) ([]Event
 	if filter.Limit <= 0 || filter.Limit > MaxQueryLimit {
 		filter.Limit = DefaultLimit
 	}
+	limit := filter.Limit
 
 	// Build label selector - use labels for exact filtering (much faster than content search)
 	sel := loki.Selector{Labels: map[string]string{
@@ -87,76 +91,106 @@ func (b *LokiBackend) Search(ctx context.Context, filter *SearchFilter) ([]Event
 		log.Printf("[audit-debug] search query=%s start=%s end=%s limit=%d", queryExpr, filter.Start.Format(time.RFC3339Nano), filter.End.Format(time.RFC3339Nano), filter.Limit)
 	}
 
-	resp, err := b.client.QueryRange(ctx, queryExpr, filter.Start, filter.End, filter.Limit)
-	if err != nil {
-		return nil, fmt.Errorf("loki search query failed: %w", err)
-	}
-
-	events := make([]Event, 0, filter.Limit)
+	matcher := newSearchFilterMatcher(filter, limit)
+	events := make([]Event, 0, limit)
 	logged := 0
-	for _, r := range resp.Data.Result {
-		for _, v := range r.Values {
-			if len(v) != 2 {
-				continue
-			}
+	for _, w := range splitTimeRangeReverse(filter.Start, filter.End, queryChunkDuration) {
+		remaining := limit - len(events)
+		if remaining <= 0 {
+			break
+		}
 
-			tsStr, ok := v[0].(string)
-			if !ok {
-				log.Printf("failed to assert timestamp as string")
-				continue
-			}
-			t, terr := parseUnixNanoString(tsStr)
-			if terr != nil {
-				log.Printf("failed to parse timestamp: %v", terr)
-				continue
-			}
+		perCallLimit := remaining
+		if perCallLimit > maxPerQueryRangeLimit {
+			perCallLimit = maxPerQueryRangeLimit
+		}
 
-			logStr, ok := v[1].(string)
-			if !ok {
-				log.Printf("failed to assert log as string")
-				continue
+		var resp *loki.QueryRangeResponse
+		for {
+			var err error
+			resp, err = b.client.QueryRange(ctx, queryExpr, w.Start, w.End, perCallLimit)
+			if err == nil {
+				break
 			}
-			parsed := map[string]any{}
-			if err := json.Unmarshal([]byte(logStr), &parsed); err != nil {
-				log.Printf("failed to unmarshal audit log: %v", err)
-				if debug && logged < 3 {
-					log.Printf("[audit-debug] raw_line=%q", truncateDebugLine(logStr))
-					logged++
+			if isResponseTooLargeErr(err) && perCallLimit > 1 {
+				perCallLimit = perCallLimit / 2
+				if perCallLimit < 1 {
+					perCallLimit = 1
 				}
 				continue
 			}
+			return nil, fmt.Errorf("loki search query failed: %w", err)
+		}
 
-			// Vector wraps the audit log under the 'audit' key
-			// Extract it so we have the standard Vault audit structure
-			auditData := parsed
-			if auditNested, ok := parsed["audit"].(map[string]any); ok {
-				auditData = auditNested
+		for _, r := range resp.Data.Result {
+			for _, v := range r.Values {
+				if len(v) != 2 {
+					continue
+				}
+
+				tsStr, ok := v[0].(string)
+				if !ok {
+					log.Printf("failed to assert timestamp as string")
+					continue
+				}
+				t, terr := parseUnixNanoString(tsStr)
+				if terr != nil {
+					log.Printf("failed to parse timestamp: %v", terr)
+					continue
+				}
+
+				logStr, ok := v[1].(string)
+				if !ok {
+					log.Printf("failed to assert log as string")
+					continue
+				}
+				parsed := map[string]any{}
+				if err := json.Unmarshal([]byte(logStr), &parsed); err != nil {
+					log.Printf("failed to unmarshal audit log: %v", err)
+					if debug && logged < 3 {
+						log.Printf("[audit-debug] raw_line=%q", truncateDebugLine(logStr))
+						logged++
+					}
+					continue
+				}
+
+				// Vector wraps the audit log under the 'audit' key
+				// Extract it so we have the standard Vault audit structure
+				auditData := parsed
+				if auditNested, ok := parsed["audit"].(map[string]any); ok {
+					auditData = auditNested
+				}
+
+				if debug && logged < 3 {
+					reqBlock, _ := auditData["request"].(map[string]any)
+					reqPath, _ := reqBlock["path"].(string)
+					reqOp, _ := reqBlock["operation"].(string)
+					reqMountType, _ := reqBlock["mount_type"].(string)
+					reqMountClass, _ := reqBlock["mount_class"].(string)
+					log.Printf("[audit-debug] request path=%q op=%q mount_type=%q mount_class=%q", reqPath, reqOp, reqMountType, reqMountClass)
+					logged++
+				}
+
+				Redact(auditData)
+
+				ev := Event{
+					Time:   t,
+					Raw:    auditData,
+					Stream: r.Stream,
+				}
+				populateFromAudit(&ev, auditData)
+
+				if matcher.matches(ev) {
+					events = append(events, ev)
+					if len(events) >= limit {
+						return events, nil
+					}
+				}
 			}
-
-			if debug && logged < 3 {
-				reqBlock, _ := auditData["request"].(map[string]any)
-				reqPath, _ := reqBlock["path"].(string)
-				reqOp, _ := reqBlock["operation"].(string)
-				reqMountType, _ := reqBlock["mount_type"].(string)
-				reqMountClass, _ := reqBlock["mount_class"].(string)
-				log.Printf("[audit-debug] request path=%q op=%q mount_type=%q mount_class=%q", reqPath, reqOp, reqMountType, reqMountClass)
-				logged++
-			}
-
-			Redact(auditData)
-
-			ev := Event{
-				Time:   t,
-				Raw:    auditData,
-				Stream: r.Stream,
-			}
-			populateFromAudit(&ev, auditData)
-			events = append(events, ev)
 		}
 	}
 
-	filtered := applySearchFilters(events, filter)
-	return filtered, nil
+	return events, nil
 }
 
 // Aggregate returns event counts grouped by the specified dimension.
@@ -335,53 +369,83 @@ func applySearchFilters(events []Event, filter *SearchFilter) []Event {
 		limit = DefaultLimit
 	}
 
-	namespace := normalizeNamespace(filter.Namespace)
-	operation := strings.TrimSpace(filter.Operation)
-	mountType := strings.TrimSpace(filter.MountType)
-	mountClass := strings.TrimSpace(filter.MountClass)
-	status := strings.TrimSpace(filter.Status)
-	policy := strings.TrimSpace(filter.Policy)
-	entityID := strings.TrimSpace(filter.EntityID)
-	loginQuery := strings.EqualFold(operation, "login")
-
-	if namespace == "" && operation == "" && mountType == "" && mountClass == "" && status == "" && policy == "" && entityID == "" {
+	matcher := newSearchFilterMatcher(filter, limit)
+	if matcher.isNoop() {
 		return events
 	}
 
 	filtered := make([]Event, 0, len(events))
 	for _, ev := range events {
-		if namespace != "" && !strings.EqualFold(ev.Namespace, namespace) {
-			continue
-		}
-		if loginQuery {
-			if !strings.Contains(strings.ToLower(ev.Path), "/login") {
-				continue
+		if matcher.matches(ev) {
+			filtered = append(filtered, ev)
+			if len(filtered) >= limit {
+				break
 			}
-		} else if operation != "" && !operationMatches(ev.Operation, operation) {
-			continue
-		}
-		if mountType != "" && !strings.EqualFold(ev.MountType, mountType) {
-			continue
-		}
-		if mountClass != "" && !strings.EqualFold(ev.MountClass, mountClass) {
-			continue
-		}
-		if status != "" && !strings.EqualFold(ev.Status, status) {
-			continue
-		}
-		if policy != "" && !containsPolicy(ev.Policies, policy) && !containsPolicy(ev.TokenPolicies, policy) {
-			continue
-		}
-		if entityID != "" && !strings.EqualFold(ev.EntityID, entityID) {
-			continue
-		}
-		filtered = append(filtered, ev)
-		if len(filtered) >= limit {
-			break
 		}
 	}
 
 	return filtered
+}
+
+type searchFilterMatcher struct {
+	namespace  string
+	operation  string
+	mountType  string
+	mountClass string
+	status     string
+	policy     string
+	entityID   string
+	loginQuery bool
+}
+
+func newSearchFilterMatcher(filter *SearchFilter, _ int) searchFilterMatcher {
+	if filter == nil {
+		return searchFilterMatcher{}
+	}
+	operation := strings.TrimSpace(filter.Operation)
+	return searchFilterMatcher{
+		namespace:  normalizeNamespace(filter.Namespace),
+		operation:  operation,
+		mountType:  strings.TrimSpace(filter.MountType),
+		mountClass: strings.TrimSpace(filter.MountClass),
+		status:     strings.TrimSpace(filter.Status),
+		policy:     strings.TrimSpace(filter.Policy),
+		entityID:   strings.TrimSpace(filter.EntityID),
+		loginQuery: strings.EqualFold(operation, "login"),
+	}
+}
+
+func (m searchFilterMatcher) isNoop() bool {
+	return m.namespace == "" && m.operation == "" && m.mountType == "" && m.mountClass == "" && m.status == "" && m.policy == "" && m.entityID == ""
+}
+
+func (m searchFilterMatcher) matches(ev Event) bool {
+	if m.namespace != "" && !strings.EqualFold(ev.Namespace, m.namespace) {
+		return false
+	}
+	if m.loginQuery {
+		if !strings.Contains(strings.ToLower(ev.Path), "/login") {
+			return false
+		}
+	} else if m.operation != "" && !operationMatches(ev.Operation, m.operation) {
+		return false
+	}
+	if m.mountType != "" && !strings.EqualFold(ev.MountType, m.mountType) {
+		return false
+	}
+	if m.mountClass != "" && !strings.EqualFold(ev.MountClass, m.mountClass) {
+		return false
+	}
+	if m.status != "" && !strings.EqualFold(ev.Status, m.status) {
+		return false
+	}
+	if m.policy != "" && !containsPolicy(ev.Policies, m.policy) && !containsPolicy(ev.TokenPolicies, m.policy) {
+		return false
+	}
+	if m.entityID != "" && !strings.EqualFold(ev.EntityID, m.entityID) {
+		return false
+	}
+	return true
 }
 
 // containsPolicy checks if a policy name exists in a slice of policies (case-insensitive)
@@ -444,58 +508,125 @@ func (b *LokiBackend) Trace(ctx context.Context, filter *TraceFilter) ([]Event, 
 	// Use content filter to find request ID in JSON payload
 	query := fmt.Sprintf(`%s |= %q`, sel.String(), filter.RequestID)
 
-	resp, err := b.client.QueryRange(ctx, query, filter.Start, filter.End, filter.Limit)
-	if err != nil {
-		return nil, fmt.Errorf("loki trace query failed: %w", err)
-	}
-
 	events := make([]Event, 0, filter.Limit)
-	for _, r := range resp.Data.Result {
-		for _, v := range r.Values {
-			if len(v) != 2 {
+	for _, w := range splitTimeRangeReverse(filter.Start, filter.End, queryChunkDuration) {
+		remaining := filter.Limit - len(events)
+		if remaining <= 0 {
+			break
+		}
+
+		perCallLimit := remaining
+		if perCallLimit > maxPerQueryRangeLimit {
+			perCallLimit = maxPerQueryRangeLimit
+		}
+
+		var resp *loki.QueryRangeResponse
+		for {
+			var err error
+			resp, err = b.client.QueryRange(ctx, query, w.Start, w.End, perCallLimit)
+			if err == nil {
+				break
+			}
+			if isResponseTooLargeErr(err) && perCallLimit > 1 {
+				perCallLimit = perCallLimit / 2
+				if perCallLimit < 1 {
+					perCallLimit = 1
+				}
 				continue
 			}
+			return nil, fmt.Errorf("loki trace query failed: %w", err)
+		}
 
-			tsStr, ok := v[0].(string)
-			if !ok {
-				log.Printf("failed to assert timestamp as string")
-				continue
-			}
-			t, terr := parseUnixNanoString(tsStr)
-			if terr != nil {
-				log.Printf("failed to parse timestamp: %v", terr)
-				continue
-			}
+		for _, r := range resp.Data.Result {
+			for _, v := range r.Values {
+				if len(v) != 2 {
+					continue
+				}
 
-			logStr, ok := v[1].(string)
-			if !ok {
-				log.Printf("failed to assert log as string")
-				continue
-			}
-			parsed := map[string]any{}
-			if err := json.Unmarshal([]byte(logStr), &parsed); err != nil {
-				log.Printf("failed to unmarshal audit log: %v", err)
-				continue
-			}
+				tsStr, ok := v[0].(string)
+				if !ok {
+					log.Printf("failed to assert timestamp as string")
+					continue
+				}
+				t, terr := parseUnixNanoString(tsStr)
+				if terr != nil {
+					log.Printf("failed to parse timestamp: %v", terr)
+					continue
+				}
 
-			// Vector wraps the audit log under the 'audit' key
-			// Extract it so we have the standard Vault audit structure
-			auditData := parsed
-			if auditNested, ok := parsed["audit"].(map[string]any); ok {
-				auditData = auditNested
-			}
+				logStr, ok := v[1].(string)
+				if !ok {
+					log.Printf("failed to assert log as string")
+					continue
+				}
+				parsed := map[string]any{}
+				if err := json.Unmarshal([]byte(logStr), &parsed); err != nil {
+					log.Printf("failed to unmarshal audit log: %v", err)
+					continue
+				}
 
-			Redact(auditData)
+				// Vector wraps the audit log under the 'audit' key
+				// Extract it so we have the standard Vault audit structure
+				auditData := parsed
+				if auditNested, ok := parsed["audit"].(map[string]any); ok {
+					auditData = auditNested
+				}
 
-			ev := Event{
-				Time:   t,
-				Raw:    auditData,
-				Stream: r.Stream,
+				Redact(auditData)
+
+				ev := Event{
+					Time:   t,
+					Raw:    auditData,
+					Stream: r.Stream,
+				}
+				populateFromAudit(&ev, auditData)
+				events = append(events, ev)
+				if len(events) >= filter.Limit {
+					return events, nil
+				}
 			}
-			populateFromAudit(&ev, auditData)
-			events = append(events, ev)
 		}
 	}
 
 	return events, nil
+}
+
+type timeWindow struct {
+	Start time.Time
+	End   time.Time
+}
+
+// splitTimeRangeReverse splits [start,end] into fixed windows from newest to oldest.
+func splitTimeRangeReverse(start, end time.Time, chunk time.Duration) []timeWindow {
+	if !end.After(start) {
+		return []timeWindow{{Start: start, End: end}}
+	}
+	if chunk <= 0 {
+		chunk = queryChunkDuration
+	}
+	if end.Sub(start) <= chunk {
+		return []timeWindow{{Start: start, End: end}}
+	}
+
+	windows := make([]timeWindow, 0, int(end.Sub(start)/chunk)+1)
+	cursor := end
+	for cursor.After(start) {
+		windowStart := cursor.Add(-chunk)
+		if windowStart.Before(start) {
+			windowStart = start
+		}
+		windows = append(windows, timeWindow{Start: windowStart, End: cursor})
+		cursor = windowStart
+	}
+	return windows
+}
+
+func isResponseTooLargeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "resourceexhausted") ||
+		strings.Contains(msg, "received message larger than max") ||
+		strings.Contains(msg, "message larger than max")
 }
