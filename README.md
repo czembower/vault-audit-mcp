@@ -1,6 +1,11 @@
 # vault-audit-mcp
 
-An MCP (Model Context Protocol) server for querying Vault audit logs from a pluggable backend provider. At present, the only supported storage backend is Loki, but intention is to develop adapters for Splunk and Elasticsearch next.
+An MCP (Model Context Protocol) server for querying Vault audit logs through a backend abstraction.
+
+Important backend status:
+- Loki is the only currently supported backend in production code.
+- The service is intentionally designed to be pluggable via the `audit.Backend` interface (`Search`, `Aggregate`, `Trace`).
+- The server currently wires `LokiBackend` in `cmd/server/main.go`.
 
 ## Features
 
@@ -49,6 +54,27 @@ The server uses stdio transport and is ready for MCP clients.
 
 - `LOKI_URL` - Loki API endpoint (default: `http://localhost:3100`)
 - `AUDIT_DEBUG_LOG` - Enable debug query logging (`1` or `true`)
+
+## Backend Architecture
+
+`internal/audit/model.go` defines the storage abstraction:
+
+```go
+type Backend interface {
+    Search(ctx context.Context, filter *SearchFilter) ([]Event, error)
+    Aggregate(ctx context.Context, filter *AggregateFilter, by string) ([]Bucket, error)
+    Trace(ctx context.Context, filter *TraceFilter) ([]Event, error)
+}
+```
+
+Current implementation:
+- `internal/audit/lokibackend.go` (`LokiBackend`)
+- configured in `cmd/server/main.go` using `LOKI_URL`
+
+Adding a new backend only requires:
+1. Implementing the `Backend` interface
+2. Constructing that backend in `cmd/server/main.go`
+3. Providing any backend-specific configuration variables
 
 ## Tools
 
@@ -106,6 +132,70 @@ Notes:
 ```bash
 go test ./internal/audit -v
 ```
+
+Integration/diagnostic tests:
+
+```bash
+python3 test_mcp.py
+```
+
+Useful Loki checks when results are empty:
+
+```bash
+curl -s 'http://localhost:3100/loki/api/v1/query?query={service="vault"}' | jq .
+curl -s 'http://localhost:3100/loki/api/v1/query?query={service="vault",log_kind="audit"}' | jq .
+curl -s 'http://localhost:3100/loki/api/v1/labels' | jq .
+```
+
+## Consolidated Reference
+
+The content previously documented in `EVENT_ANALYSIS.md`, `SUMMARIZATION.md`, and `TESTING.md` is summarized here.
+
+### Semantic Event Analysis
+
+Search results are semantically analyzed (not just counted). The analyzer classifies activity into categories and assigns severity levels (critical/high/medium/low/info), then emits high-signal insights for LLM consumers.
+
+Examples of high-signal conditions:
+- policy/audit/system configuration changes
+- system namespace operations
+- failed authentication/operation spikes
+
+Search summaries include analysis fields such as:
+- `critical_events`
+- `high_risk_events`
+- `event_categories`
+- `key_insights`
+
+### Summarization Strategy (Token Control)
+
+`audit.search_events` and `audit.trace` return condensed summaries by default to keep payloads small for LLM contexts.
+
+- `SearchSummary` includes:
+  - total events and success/error stats
+  - top namespaces/operations/mount types
+  - success rate
+  - a small sample event set
+  - `summarized` flag
+- `TraceSummary` includes:
+  - request timeline and total events
+  - first/last event context
+  - namespace/operation set
+  - sample events
+  - `summarized` flag
+
+`audit.aggregate` already returns compact bucketed counts and does not require additional summarization.
+
+### Operational Troubleshooting
+
+- No results:
+  - confirm Loki has Vault audit streams and required labels
+  - confirm query time window covers data
+  - confirm namespace/filter values are correct
+- Connection issues:
+  - `curl http://localhost:3100/ready`
+  - verify `LOKI_URL` and network routing
+- Time parsing errors:
+  - use RFC3339 timestamps (for example `2026-02-10T14:30:45Z`)
 
 ## Vault Configuration
 
