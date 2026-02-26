@@ -1,0 +1,129 @@
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+[sources.docker]
+type = "docker_logs"
+docker_host = "unix:///var/run/docker.sock"
+
+[transforms.only_vault]
+type = "filter"
+inputs = ["docker"]
+condition = '''
+    contains(string!(.container_name), "vault")
+'''
+
+[transforms.classify]
+type = "remap"
+inputs = ["only_vault"]
+source = '''
+  .msg = string!(.message)
+  .log_kind = "operational"
+
+  parsed, err = parse_json(.msg)
+
+  if err == null && is_object(parsed) && exists(parsed.type) && exists(parsed.request) {
+    .log_kind = "audit"
+    .audit = parsed
+
+    .vault_namespace = "root/"
+    if exists(.audit.request.namespace.path) {
+      .vault_namespace = string!(.audit.request.namespace.path)
+    }
+
+    .vault_operation = "unknown"
+    if exists(.audit.request.operation) {
+      .vault_operation = string!(.audit.request.operation)
+    }
+
+    .vault_mount_type = "unknown"
+    if exists(.audit.request.mount_type) {
+      .vault_mount_type = string!(.audit.request.mount_type)
+    }
+
+    .vault_mount_class = "unknown"
+    if exists(.audit.request.mount_class) {
+      .vault_mount_class = string!(.audit.request.mount_class)
+    }
+
+    .vault_audit_type = "unknown"
+    if exists(.audit.type) {
+      .vault_audit_type = string!(.audit.type)
+    }
+
+    .vault_status = "ok"
+    if exists(.audit.error) && !is_null(.audit.error) {
+      .vault_status = "error"
+    }
+
+    # Extract policy information from auth block
+    .vault_policies = "none"
+    if exists(.audit.auth.policies) && is_array(.audit.auth.policies) {
+      policies = array!(.audit.auth.policies)
+      if length(policies) > 0 {
+        .vault_policies = join!(policies, ",")
+      }
+    }
+
+    .vault_token_policies = "none"
+    if exists(.audit.auth.token_policies) && is_array(.audit.auth.token_policies) {
+      token_policies = array!(.audit.auth.token_policies)
+      if length(token_policies) > 0 {
+        .vault_token_policies = join!(token_policies, ",")
+      }
+    }
+
+    .vault_entity_id = "none"
+    if exists(.audit.auth.entity_id) && !is_null(.audit.auth.entity_id) {
+      .vault_entity_id = string!(.audit.auth.entity_id)
+    }
+
+    .vault_display_name = "none"
+    if exists(.audit.auth.display_name) && !is_null(.audit.auth.display_name) {
+      .vault_display_name = string!(.audit.auth.display_name)
+    }
+  }
+'''
+
+
+[transforms.vault_audit]
+type = "filter"
+inputs = ["classify"]
+condition = '.log_kind == "audit"'
+
+[transforms.vault_operational]
+type = "filter"
+inputs = ["classify"]
+condition = '.log_kind == "operational"'
+
+[sinks.loki_audit]
+type = "loki"
+inputs = ["vault_audit"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+
+[sinks.loki_audit.labels]
+service = "vault"
+log_kind = "audit"
+vault_namespace = "{{ vault_namespace }}"
+vault_operation = "{{ vault_operation }}"
+vault_mount_type = "{{ vault_mount_type }}"
+vault_mount_class = "{{ vault_mount_class }}"
+vault_audit_type = "{{ vault_audit_type }}"
+vault_status = "{{ vault_status }}"
+vault_policies = "{{ vault_policies }}"
+vault_token_policies = "{{ vault_token_policies }}"
+vault_entity_id = "{{ vault_entity_id }}"
+vault_display_name = "{{ vault_display_name }}"
+container = "{{ container_name }}"
+
+[sinks.loki_operational]
+type = "loki"
+inputs = ["vault_operational"]
+endpoint = "http://loki:3100"
+encoding.codec = "text"
+
+[sinks.loki_operational.labels]
+service = "vault"
+log_kind = "operational"
+container = "{{ container_name }}"

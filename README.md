@@ -3,7 +3,7 @@
 An MCP (Model Context Protocol) server for querying Vault audit logs through a backend abstraction.
 
 Important backend status:
-- Loki is the only currently supported backend in production code.
+- Loki is the only currently supported backend.
 - The service is intentionally designed to be pluggable via the `audit.Backend` interface (`Search`, `Aggregate`, `Trace`).
 - The server currently wires `LokiBackend` in `cmd/server/main.go`.
 
@@ -209,7 +209,7 @@ audit {
 }
 ```
 
-Then ship logs (Promtail, etc.) to Loki and attach the labels above.
+Then ship logs (Promtail, etc.) to Loki and attach the labels above. An example vector.toml is provided.
 
 ## Data Sensitivity
 
