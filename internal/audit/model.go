@@ -23,12 +23,27 @@ const (
 	ValueServiceVault = "vault"
 	ValueKindAudit    = "audit"
 
-	// Resource limits
+// Resource limits
 	MaxQueryLimit   = 500
 	DefaultLimit    = 100
 	MaxQueryDays    = 90
 	DefaultQueryAge = 15 * time.Minute
 )
+
+// LabelConfig controls how the Loki backend builds stream selectors.
+// When BaseLabels is nil the default {service="vault",log_kind="audit"}
+// selector is used and all Vault-specific label filters are applied.
+type LabelConfig struct {
+	// BaseLabels overrides the default stream selector labels.
+	// Example for OpenShift: {"kubernetes_namespace_name":"hashicorp-vault"}
+	BaseLabels map[string]string
+
+	// UseVaultLabels indicates whether Vault-specific stream labels
+	// (vault_operation, vault_status, etc.) exist in Loki.
+	// When false, all filtering is done via content search and Go
+	// post-processing. Defaults to true when BaseLabels is nil.
+	UseVaultLabels bool
+}
 
 // Backend defines the interface for audit log storage backends.
 type Backend interface {
