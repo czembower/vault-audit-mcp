@@ -2,6 +2,7 @@ package loki
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,16 +15,30 @@ import (
 )
 
 type Client struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	BaseURL     string
+	HTTPClient  *http.Client
+	bearerToken string
+}
+
+// ClientOptions holds optional configuration for the Loki client.
+// All fields are opt-in; zero values preserve the default behavior.
+type ClientOptions struct {
+	// BearerToken is sent as an Authorization header if non-empty.
+	BearerToken string
+	// TLSSkipVerify disables TLS certificate verification when true.
+	TLSSkipVerify bool
 }
 
 const (
-	queryRangeMaxAttempts   = 3
+	queryRangeMaxAttempts    = 3
 	queryRangeInitialBackoff = 250 * time.Millisecond
 )
 
-func NewClient(baseURL string) *Client {
+func NewClient(baseURL string, opts *ClientOptions) *Client {
+	if opts == nil {
+		opts = &ClientOptions{}
+	}
+
 	// Configure transport to handle large responses and prevent connection reuse issues
 	transport := &http.Transport{
 		MaxIdleConns:        10,
@@ -35,8 +50,13 @@ func NewClient(baseURL string) *Client {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	if opts.TLSSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	}
+
 	return &Client{
-		BaseURL: baseURL,
+		BaseURL:     baseURL,
+		bearerToken: opts.BearerToken,
 		HTTPClient: &http.Client{
 			Timeout:   90 * time.Second,
 			Transport: transport,
@@ -51,7 +71,7 @@ func (c *Client) QueryRange(ctx context.Context, query string, start, end time.T
 	if err != nil {
 		return nil, err
 	}
-	u.Path = "/loki/api/v1/query_range"
+	u.Path = strings.TrimRight(u.Path, "/") + "/loki/api/v1/query_range"
 
 	q := u.Query()
 	q.Set("query", query)
@@ -91,6 +111,10 @@ func (c *Client) queryRangeOnce(ctx context.Context, url string) (*QueryRangeRes
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
+	}
+
+	if c.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
 
 	resp, err := c.HTTPClient.Do(req)

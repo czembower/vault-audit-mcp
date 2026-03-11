@@ -14,15 +14,78 @@ import (
 
 // LokiBackend implements Backend using Loki as the storage backend.
 type LokiBackend struct {
-	client *loki.Client
+	client    *loki.Client
+	labelsCfg LabelConfig
 }
 
 const queryChunkDuration = 10 * time.Minute
 const maxPerQueryRangeLimit = 25
 
 // NewLokiBackend creates a new Loki backend instance.
-func NewLokiBackend(client *loki.Client) *LokiBackend {
-	return &LokiBackend{client: client}
+// Pass nil for cfg to use the default custom-label behaviour.
+func NewLokiBackend(client *loki.Client, cfg *LabelConfig) *LokiBackend {
+	lc := LabelConfig{UseVaultLabels: true}
+	if cfg != nil {
+		lc = *cfg
+	}
+	return &LokiBackend{client: client, labelsCfg: lc}
+}
+
+// baseSelector returns the Loki stream selector labels for this backend.
+func (b *LokiBackend) baseSelector() map[string]string {
+	if len(b.labelsCfg.BaseLabels) > 0 {
+		// Return a copy so callers can add to it without mutating config.
+		out := make(map[string]string, len(b.labelsCfg.BaseLabels))
+		for k, v := range b.labelsCfg.BaseLabels {
+			out[k] = v
+		}
+		return out
+	}
+	return map[string]string{
+		LabelService: ValueServiceVault,
+		LabelKind:    ValueKindAudit,
+	}
+}
+
+// extractAuditData unwraps the Vault audit JSON from various log envelopes.
+// It handles:
+//   - CLF/Vector envelope: outer JSON with .message containing stringified Vault JSON
+//   - Vector audit wrapper: {"audit": {...}}
+//   - Plain Vault audit JSON (no wrapping)
+func extractAuditData(parsed map[string]any) (map[string]any, bool) {
+	// CLF envelope: the actual log is a JSON string inside .message
+	if msgStr, ok := parsed["message"].(string); ok {
+		var inner map[string]any
+		if err := json.Unmarshal([]byte(msgStr), &inner); err == nil {
+			// Check if this looks like a Vault audit log (has "type" and/or "request")
+			if _, hasType := inner["type"]; hasType {
+				return inner, true
+			}
+			if _, hasReq := inner["request"]; hasReq {
+				return inner, true
+			}
+			// Not a Vault audit log
+			return nil, false
+		}
+		// .message wasn't JSON — not a Vault audit log
+		return nil, false
+	}
+
+	// Vector wraps the audit log under the 'audit' key
+	if auditNested, ok := parsed["audit"].(map[string]any); ok {
+		return auditNested, true
+	}
+
+	// Plain Vault audit JSON — verify it looks right
+	if _, hasType := parsed["type"]; hasType {
+		return parsed, true
+	}
+	if _, hasReq := parsed["request"]; hasReq {
+		return parsed, true
+	}
+
+	// Doesn't look like a Vault audit event
+	return nil, false
 }
 
 // normalizeNamespace ensures namespace paths have a trailing slash for consistency
@@ -56,37 +119,42 @@ func (b *LokiBackend) Search(ctx context.Context, filter *SearchFilter) ([]Event
 	}
 	limit := filter.Limit
 
-	// Build label selector - use labels for exact filtering (much faster than content search)
-	sel := loki.Selector{Labels: map[string]string{
-		LabelService: ValueServiceVault,
-		LabelKind:    ValueKindAudit,
-	}}
-	if filter.Namespace != "" {
-		sel.Labels[LabelNamespace] = normalizeNamespace(filter.Namespace)
-	}
-	// Use label filters for better performance, except for special cases
-	if filter.Status != "" {
-		sel.Labels[LabelStatus] = filter.Status
-	}
-	if filter.MountType != "" {
-		sel.Labels[LabelMountType] = filter.MountType
-	}
-	if filter.MountClass != "" {
-		sel.Labels[LabelMountClass] = filter.MountClass
-	}
-	// Add operation label filter for normal operations
-	// Special cases (login, write/update aliasing) handled in buildLogQLExpression
-	opLower := strings.ToLower(strings.TrimSpace(filter.Operation))
-	if filter.Operation != "" && opLower != "login" && opLower != "write" && opLower != "update" {
-		sel.Labels[LabelOperation] = filter.Operation
+	// Build label selector
+	sel := loki.Selector{Labels: b.baseSelector()}
+
+	// When Vault-specific labels are available, add them for fast filtering.
+	if b.labelsCfg.UseVaultLabels {
+		if filter.Namespace != "" {
+			sel.Labels[LabelNamespace] = normalizeNamespace(filter.Namespace)
+		}
+		if filter.Status != "" {
+			sel.Labels[LabelStatus] = filter.Status
+		}
+		if filter.MountType != "" {
+			sel.Labels[LabelMountType] = filter.MountType
+		}
+		if filter.MountClass != "" {
+			sel.Labels[LabelMountClass] = filter.MountClass
+		}
+		opLower := strings.ToLower(strings.TrimSpace(filter.Operation))
+		if filter.Operation != "" && opLower != "login" && opLower != "write" && opLower != "update" {
+			sel.Labels[LabelOperation] = filter.Operation
+		}
+		if filter.EntityID != "" {
+			sel.Labels[LabelEntityID] = filter.EntityID
+		}
 	}
 
-	// Add entity_id label filter if specified
-	if filter.EntityID != "" {
-		sel.Labels[LabelEntityID] = filter.EntityID
+	var queryExpr string
+	if b.labelsCfg.UseVaultLabels {
+		queryExpr = buildLogQLExpression(sel.String(), filter.Operation, "", "", filter.Policy)
+	} else {
+		// Content-only mode (CLF/OCP): audit JSON is stringified inside a
+		// "message" field, so inner quotes are backslash-escaped in the raw
+		// Loki text (e.g. \"request\":{).  Use a regex with optional
+		// backslashes so the filter matches both CLF-wrapped and plain formats.
+		queryExpr = addRegexFilter(sel.String(), `\\?"request\\?":\{`)
 	}
-
-	queryExpr := buildLogQLExpression(sel.String(), filter.Operation, "", "", filter.Policy)
 	if debug {
 		log.Printf("[audit-debug] search query=%s start=%s end=%s limit=%d", queryExpr, filter.Start.Format(time.RFC3339Nano), filter.End.Format(time.RFC3339Nano), filter.Limit)
 	}
@@ -154,11 +222,10 @@ func (b *LokiBackend) Search(ctx context.Context, filter *SearchFilter) ([]Event
 					continue
 				}
 
-				// Vector wraps the audit log under the 'audit' key
-				// Extract it so we have the standard Vault audit structure
-				auditData := parsed
-				if auditNested, ok := parsed["audit"].(map[string]any); ok {
-					auditData = auditNested
+				auditData, ok := extractAuditData(parsed)
+				if !ok {
+					// Not a Vault audit event (e.g. operational log)
+					continue
 				}
 
 				if debug && logged < 3 {
@@ -246,15 +313,56 @@ func (b *LokiBackend) Aggregate(ctx context.Context, filter *AggregateFilter, by
 		return buckets, nil
 	}
 
+	// When Vault-specific labels aren't available, fall back to search-based aggregation
+	// (we can't do `sum by (vault_operation)` when those labels don't exist).
+	if !b.labelsCfg.UseVaultLabels {
+		events, err := b.Search(ctx, &SearchFilter{
+			Start:      filter.Start,
+			End:        filter.End,
+			Limit:      MaxQueryLimit,
+			Namespace:  filter.Namespace,
+			Operation:  filter.Operation,
+			MountType:  filter.MountType,
+			MountClass: filter.MountClass,
+			Status:     filter.Status,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		counts := make(map[string]int)
+		for _, ev := range events {
+			var key string
+			switch by {
+			case LabelNamespace:
+				key = ev.Namespace
+			case LabelOperation:
+				key = ev.Operation
+			case LabelMountType:
+				key = ev.MountType
+			case LabelMountClass:
+				key = ev.MountClass
+			case LabelStatus:
+				key = ev.Status
+			}
+			if key == "" {
+				key = "(none)"
+			}
+			counts[key]++
+		}
+
+		buckets := make([]Bucket, 0, len(counts))
+		for k, v := range counts {
+			buckets = append(buckets, Bucket{Key: k, Value: float64(v)})
+		}
+		return buckets, nil
+	}
+
 	// Build label selector - use labels for exact filtering (much faster than content search)
-	sel := loki.Selector{Labels: map[string]string{
-		LabelService: ValueServiceVault,
-		LabelKind:    ValueKindAudit,
-	}}
+	sel := loki.Selector{Labels: b.baseSelector()}
 	if filter.Namespace != "" {
 		sel.Labels[LabelNamespace] = normalizeNamespace(filter.Namespace)
 	}
-	// Use label filters for better performance
 	if filter.Status != "" {
 		sel.Labels[LabelStatus] = filter.Status
 	}
@@ -264,14 +372,12 @@ func (b *LokiBackend) Aggregate(ctx context.Context, filter *AggregateFilter, by
 	if filter.MountClass != "" {
 		sel.Labels[LabelMountClass] = filter.MountClass
 	}
-	// Add operation label filter for normal operations
 	opLower := strings.ToLower(strings.TrimSpace(filter.Operation))
 	if filter.Operation != "" && opLower != "login" && opLower != "write" && opLower != "update" {
 		sel.Labels[LabelOperation] = filter.Operation
 	}
 
 	// Calculate aggregation window based on query duration (e.g., 1% of total duration, min 1m, max 1h)
-	// Note: 'duration' already calculated above for validation
 	window := duration / 100
 	if window < time.Minute {
 		window = time.Minute
@@ -500,10 +606,7 @@ func (b *LokiBackend) Trace(ctx context.Context, filter *TraceFilter) ([]Event, 
 	}
 
 	// Build label selector
-	sel := loki.Selector{Labels: map[string]string{
-		LabelService: ValueServiceVault,
-		LabelKind:    ValueKindAudit,
-	}}
+	sel := loki.Selector{Labels: b.baseSelector()}
 
 	// Use content filter to find request ID in JSON payload
 	query := fmt.Sprintf(`%s |= %q`, sel.String(), filter.RequestID)
@@ -565,11 +668,9 @@ func (b *LokiBackend) Trace(ctx context.Context, filter *TraceFilter) ([]Event, 
 					continue
 				}
 
-				// Vector wraps the audit log under the 'audit' key
-				// Extract it so we have the standard Vault audit structure
-				auditData := parsed
-				if auditNested, ok := parsed["audit"].(map[string]any); ok {
-					auditData = auditNested
+				auditData, ok := extractAuditData(parsed)
+				if !ok {
+					continue
 				}
 
 				Redact(auditData)

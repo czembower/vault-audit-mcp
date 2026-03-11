@@ -17,9 +17,11 @@ Important backend status:
 ## Prerequisites (Loki-specific)
 
 - Vault configured with an audit device that ships logs to Loki
-- Loki instance receiving Vault audit logs with these baseline labels:
-  - `service=vault`
-  - `log_kind=audit`
+- Loki instance receiving Vault audit logs
+
+### Option A: Custom Vault labels (recommended for performance)
+
+If your log pipeline enriches Vault audit streams with dedicated labels, the server uses them for fast label-based filtering. The default stream selector is `{service="vault", log_kind="audit"}`.
 
 For full filtering support, ensure these labels are also present:
 
@@ -31,6 +33,16 @@ For full filtering support, ensure these labels are also present:
 - `vault_entity_id`
 - `vault_policies` (comma-separated)
 - `vault_token_policies` (comma-separated)
+
+### Option B: OpenShift / generic Kubernetes (CLF mode)
+
+If Vault audit logs are collected by the platform log forwarder (e.g., OpenShift Cluster Logging) without custom labels, set `LOKI_BASE_LABELS` to match your Loki stream selector. The server will automatically fall back to content-based filtering and Go post-processing.
+
+```bash
+export LOKI_BASE_LABELS='{"kubernetes_namespace_name":"hashicorp-vault"}'
+```
+
+In this mode the audit JSON is expected inside a CLF `message` field (the server handles unwrapping automatically).
 
 ## Building
 
@@ -53,6 +65,9 @@ The server uses stdio transport and is ready for MCP clients.
 ### Environment Variables
 
 - `LOKI_URL` - Loki API endpoint (default: `http://localhost:3100`)
+- `LOKI_BASE_LABELS` - JSON object overriding the default stream selector labels. When set, Vault-specific label filters are disabled and the server uses content-based filtering instead. Example: `'{"kubernetes_namespace_name":"hashicorp-vault"}'`
+- `LOKI_BEARER_TOKEN` - Bearer token sent in the `Authorization` header for authenticated Loki endpoints (e.g., OpenShift LokiStack gateway)
+- `LOKI_TLS_SKIP_VERIFY` - Disable TLS certificate verification for the Loki connection (`true` or `false`, default `false`)
 - `AUDIT_DEBUG_LOG` - Enable debug query logging (`1` or `true`)
 
 ## Backend Architecture
@@ -142,9 +157,16 @@ python3 test_mcp.py
 Useful Loki checks when results are empty:
 
 ```bash
+# Default labels mode
 curl -s 'http://localhost:3100/loki/api/v1/query?query={service="vault"}' | jq .
 curl -s 'http://localhost:3100/loki/api/v1/query?query={service="vault",log_kind="audit"}' | jq .
 curl -s 'http://localhost:3100/loki/api/v1/labels' | jq .
+
+# OCP / LokiStack mode (adjust URL and token to match your environment)
+curl -sk -H "Authorization: Bearer $LOKI_BEARER_TOKEN" \
+  "$LOKI_URL/loki/api/v1/labels" | jq .
+curl -sk -H "Authorization: Bearer $LOKI_BEARER_TOKEN" \
+  "$LOKI_URL/loki/api/v1/label/kubernetes_namespace_name/values" | jq .
 ```
 
 ## Consolidated Reference
